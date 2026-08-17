@@ -13,7 +13,10 @@ return [
     |
     */
 
-    'default' => 'redis', // env('QUEUE_CONNECTION', 'database'),
+    // Redis is forced outside of testing so a stale QUEUE_CONNECTION in a user's
+    // .env cannot break Horizon. Tests honor phpunit.xml's QUEUE_CONNECTION=sync
+    // so dispatched jobs run inline against the test database.
+    'default' => env('APP_ENV') === 'testing' ? env('QUEUE_CONNECTION', 'sync') : 'redis',
 
     /*
     |--------------------------------------------------------------------------

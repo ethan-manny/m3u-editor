@@ -5,8 +5,7 @@ namespace App\Jobs;
 use App\Models\Category;
 use App\Models\CustomPlaylist;
 use App\Models\Group;
-use App\Models\User;
-use Filament\Notifications\Notification;
+use App\Services\PlaylistService;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Spatie\Tags\Tag;
@@ -14,6 +13,10 @@ use Spatie\Tags\Tag;
 class AddGroupsToCustomPlaylist implements ShouldQueue
 {
     use Queueable;
+
+    public $tries = 1;
+
+    public $timeout = 60 * 10;
 
     /**
      * Create a new job instance.
@@ -31,35 +34,33 @@ class AddGroupsToCustomPlaylist implements ShouldQueue
 
     /**
      * Execute the job.
+     *
+     * Resolves each group's items and tag up front, then fans the actual work out
+     * to parallel AddItemsToCustomPlaylistChunk jobs so very large groups (100k+
+     * channels) finish quickly and never exceed a single job's timeout.
      */
     public function handle(): void
     {
         $playlist = CustomPlaylist::findOrFail($this->customPlaylistId);
-        $user = User::findOrFail($this->userId);
 
         $isSeries = $this->type === 'series';
         $tagType = $isSeries ? $playlist->uuid.'-category' : $playlist->uuid;
         $relation = $isSeries ? 'series' : 'channels';
-        $syncRelation = $isSeries ? 'series' : 'channels';
 
         $mode = $this->data['mode'] ?? 'select';
-        $tagName = null;
+        $tagName = match ($mode) {
+            'select' => $this->data['category'] ?? null,
+            'create' => $this->data['new_category'] ?? null,
+            default => null,
+        };
 
-        if ($mode === 'select') {
-            $tagName = $this->data['category'] ?? null;
-        } elseif ($mode === 'create') {
-            $tagName = $this->data['new_category'] ?? null;
-        }
-
-        // For select/create modes, create the tag once upfront for all groups
-        $sharedTag = null;
+        // Tag creation is not race-safe, so all tags are created here before the
+        // parallel chunk jobs run; the chunks then only look up existing tags
         if ($mode !== 'original' && $tagName) {
-            $sharedTag = Tag::findOrCreate($tagName, $tagType);
-            $playlist->attachTag($sharedTag);
+            $playlist->attachTag(Tag::findOrCreate($tagName, $tagType));
         }
 
-        $playlistTags = $playlist->tagsWithType($tagType);
-
+        $chunkJobs = [];
         foreach ($this->groupIds as $groupId) {
             $group = $isSeries
                 ? Category::find($groupId)
@@ -70,40 +71,25 @@ class AddGroupsToCustomPlaylist implements ShouldQueue
             }
 
             // For 'original' mode, derive the tag name from the group/category model
-            $tag = $sharedTag;
+            $groupTagName = $tagName;
             if ($mode === 'original') {
-                $originalName = $group->name ?? $group->name_internal ?? null;
-                if (! $originalName) {
+                $groupTagName = $group->name ?? $group->name_internal ?? null;
+                if (! $groupTagName) {
                     continue;
                 }
-                $tag = Tag::findOrCreate($originalName, $tagType);
-                $playlist->attachTag($tag);
+                $playlist->attachTag(Tag::findOrCreate($groupTagName, $tagType));
             }
 
-            // Chunk through the group's items to avoid memory exhaustion on large groups
-            $group->$relation()->chunkById(1000, function ($items) use ($playlist, $syncRelation, $playlistTags, $tag): void {
-                $ids = $items->pluck('id')->all();
-                $playlist->$syncRelation()->syncWithoutDetaching($ids);
-
-                if ($tag) {
-                    foreach ($items as $item) {
-                        $item->detachTags($playlistTags);
-                        $item->attachTag($tag);
-                    }
-                }
-            });
+            foreach ($group->$relation()->pluck('id')->chunk(PlaylistService::CUSTOM_PLAYLIST_CHUNK_SIZE) as $chunk) {
+                $chunkJobs[] = new AddItemsToCustomPlaylistChunk(
+                    customPlaylistId: $this->customPlaylistId,
+                    itemIds: $chunk->values()->all(),
+                    tagName: $groupTagName,
+                    type: $this->type,
+                );
+            }
         }
 
-        Notification::make()
-            ->success()
-            ->title(__('Items added to custom playlist'))
-            ->body(__('The selected items have been added to the chosen custom playlist.'))
-            ->broadcast($user);
-
-        Notification::make()
-            ->success()
-            ->title(__('Items added to custom playlist'))
-            ->body(__('The selected items have been added to the chosen custom playlist.'))
-            ->sendToDatabase($user);
+        AddItemsToCustomPlaylist::dispatchChunkedBatch($chunkJobs, $this->userId);
     }
 }

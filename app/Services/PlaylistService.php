@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Jobs\AddGroupsToCustomPlaylist;
+use App\Jobs\AddItemsToCustomPlaylist;
 use App\Jobs\MergeChannels;
 use App\Jobs\MergeEpisodes;
 use App\Jobs\UnmergeChannels;
@@ -15,6 +16,7 @@ use App\Models\MergedPlaylist;
 use App\Models\Playlist;
 use App\Models\PlaylistAlias;
 use App\Models\PlaylistAuth;
+use App\Models\Series;
 use App\Settings\GeneralSettings;
 use Carbon\Carbon;
 use Exception;
@@ -38,6 +40,7 @@ use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Spatie\Tags\Tag;
@@ -47,6 +50,12 @@ use Spatie\Tags\Tag;
  */
 class PlaylistService
 {
+    /**
+     * Number of items processed per query/chunk job when bulk-updating custom
+     * playlist membership and tags.
+     */
+    public const CUSTOM_PLAYLIST_CHUNK_SIZE = 1000;
+
     /**
      * Get the base URL of the application, including port if set
      *
@@ -937,24 +946,15 @@ class PlaylistService
      */
     public static function addItemsToPlaylist(CustomPlaylist $playlist, $items, $data, string $type = 'channel'): void
     {
-        $isSeries = $type === 'series';
-        $tagFunction = $isSeries ? 'categoryTags' : 'groupTags';
-        $relation = $isSeries ? 'series' : 'channels';
-        $tagType = $isSeries ? $playlist->uuid.'-category' : $playlist->uuid;
-
         // Get IDs for syncing
-        $ids = [];
-        if ($items instanceof Relation || $items instanceof Builder) {
-            $ids = $items->pluck('id');
-        } elseif ($items instanceof Collection) {
-            $ids = $items->pluck('id');
+        if ($items instanceof Relation || $items instanceof Builder || $items instanceof Collection) {
+            $ids = $items->pluck('id')->all();
         } else {
+            $ids = [];
             foreach ($items as $item) {
                 $ids[] = $item->id;
             }
         }
-
-        $playlist->$relation()->syncWithoutDetaching($ids);
 
         // Parse data
         $mode = 'select';
@@ -971,39 +971,175 @@ class PlaylistService
             $tagName = $data;
         }
 
-        $playlistTags = $playlist->$tagFunction()->get();
-        // Get iterator for tagging
-        $cursor = ($items instanceof Builder || $items instanceof Relation)
-            ? $items->cursor()
-            : $items;
+        foreach (array_chunk($ids, self::CUSTOM_PLAYLIST_CHUNK_SIZE) as $chunk) {
+            self::syncItemsToCustomPlaylist(
+                playlist: $playlist,
+                itemIds: $chunk,
+                tagName: $mode === 'original' ? null : $tagName,
+                useOriginalTagNames: $mode === 'original',
+                type: $type,
+            );
+        }
+    }
 
-        if ($mode === 'original') {
-            foreach ($cursor as $item) {
-                // Determine original name
-                $originalName = null;
-                if ($isSeries) {
-                    $originalName = $item->category->name ?? null;
-                } else {
-                    $originalName = $item->group;
-                }
+    /**
+     * Bulk-add items to a custom playlist and apply their custom group tag using
+     * set-based queries. Every statement is idempotent and conflict-safe, so this
+     * can run from parallel chunk jobs — with the caveat that any tag it needs
+     * should already exist (Tag::findOrCreate is not race-safe; see
+     * ensureCustomPlaylistTagsExist()).
+     *
+     * @param  array<int>  $itemIds
+     * @param  string|null  $tagName  Custom group tag applied to all items (null: sync only)
+     * @param  bool  $useOriginalTagNames  Tag each item with its own group/category name instead
+     */
+    public static function syncItemsToCustomPlaylist(
+        CustomPlaylist $playlist,
+        array $itemIds,
+        ?string $tagName = null,
+        bool $useOriginalTagNames = false,
+        string $type = 'channel',
+    ): void {
+        if ($itemIds === []) {
+            return;
+        }
 
-                if ($originalName) {
-                    $tag = Tag::findOrCreate($originalName, $tagType);
-                    $playlist->attachTag($tag);
+        $isSeries = $type === 'series';
+        $tagType = $isSeries ? $playlist->uuid.'-category' : $playlist->uuid;
+        $relation = $isSeries ? $playlist->series() : $playlist->channels();
 
-                    $item->detachTags($playlistTags);
-                    $item->attachTag($tag);
-                }
+        // insertOrIgnore (rather than syncWithoutDetaching) preserves existing pivot
+        // rows and their channel_number/sort values without loading the playlist's
+        // entire pivot table into memory (same approach as AutoSyncGroupsToCustomPlaylist)
+        DB::table($relation->getTable())->insertOrIgnore(
+            array_map(fn ($itemId) => [
+                $relation->getForeignPivotKeyName() => $playlist->id,
+                $relation->getRelatedPivotKeyName() => $itemId,
+            ], $itemIds)
+        );
+
+        if ($useOriginalTagNames) {
+            foreach (self::itemIdsByOriginalGroupName($itemIds, $isSeries) as $name => $ids) {
+                self::applyCustomGroupTag($playlist, Tag::findOrCreate($name, $tagType), $ids, $isSeries);
             }
         } elseif ($tagName) {
-            $tag = Tag::findOrCreate($tagName, $tagType);
-            $playlist->attachTag($tag);
+            self::applyCustomGroupTag($playlist, Tag::findOrCreate($tagName, $tagType), $itemIds, $isSeries);
+        }
+    }
 
-            foreach ($cursor as $item) {
-                $item->detachTags($playlistTags);
-                $item->attachTag($tag);
+    /**
+     * Pre-create the custom group tags that syncItemsToCustomPlaylist() will need
+     * for the given items, and attach them to the playlist. Tag creation is not
+     * race-safe, so this must run in a single process (e.g. the parent job) before
+     * parallel chunk jobs are dispatched.
+     *
+     * @param  array<int>  $itemIds  Only used in 'original' mode to resolve per-item names
+     */
+    public static function ensureCustomPlaylistTagsExist(
+        CustomPlaylist $playlist,
+        array $itemIds,
+        ?string $tagName = null,
+        bool $useOriginalTagNames = false,
+        string $type = 'channel',
+    ): void {
+        $isSeries = $type === 'series';
+        $tagType = $isSeries ? $playlist->uuid.'-category' : $playlist->uuid;
+
+        if (! $useOriginalTagNames) {
+            if ($tagName) {
+                $playlist->attachTag(Tag::findOrCreate($tagName, $tagType));
+            }
+
+            return;
+        }
+
+        foreach (array_chunk($itemIds, self::CUSTOM_PLAYLIST_CHUNK_SIZE) as $chunk) {
+            foreach (array_keys(self::itemIdsByOriginalGroupName($chunk, $isSeries)) as $name) {
+                $playlist->attachTag(Tag::findOrCreate($name, $tagType));
             }
         }
+    }
+
+    /**
+     * Bucket item IDs by the name of their original group (channels) or category
+     * (series). Items without one are omitted and keep their current tags,
+     * mirroring the original-mode behavior of addItemsToPlaylist().
+     *
+     * @param  array<int>  $itemIds
+     * @return array<string, array<int>>
+     */
+    private static function itemIdsByOriginalGroupName(array $itemIds, bool $isSeries): array
+    {
+        $namesByItemId = $isSeries
+            ? Series::query()
+                ->join('categories', 'categories.id', '=', 'series.category_id')
+                ->whereIn('series.id', $itemIds)
+                ->pluck('categories.name', 'series.id')
+            : Channel::query()
+                ->whereIn('id', $itemIds)
+                ->pluck('group', 'id');
+
+        $buckets = [];
+        foreach ($namesByItemId as $itemId => $name) {
+            if ($name !== null && $name !== '') {
+                $buckets[$name][] = $itemId;
+            }
+        }
+
+        return $buckets;
+    }
+
+    /**
+     * Tag items with a custom playlist group tag, replacing any other group tag of
+     * the same playlist (an item belongs to at most one group per custom playlist).
+     * Set-based and conflict-safe via the taggables unique index, so parallel chunk
+     * jobs cannot duplicate rows.
+     *
+     * @param  array<int>  $itemIds
+     */
+    private static function applyCustomGroupTag(CustomPlaylist $playlist, Tag $tag, array $itemIds, bool $isSeries): void
+    {
+        $morphClass = $isSeries ? (new Series)->getMorphClass() : (new Channel)->getMorphClass();
+
+        // Make the tag visible as a group on the playlist itself
+        DB::table('taggables')->insertOrIgnore([
+            'tag_id' => $tag->id,
+            'taggable_type' => $playlist->getMorphClass(),
+            'taggable_id' => $playlist->id,
+        ]);
+
+        DB::table('taggables')
+            ->where('taggable_type', $morphClass)
+            ->whereIn('taggable_id', $itemIds)
+            ->where('tag_id', '!=', $tag->id)
+            ->whereIn('tag_id', Tag::query()->where('type', $tag->type)->select('id'))
+            ->delete();
+
+        DB::table('taggables')->insertOrIgnore(
+            array_map(fn ($itemId) => [
+                'tag_id' => $tag->id,
+                'taggable_type' => $morphClass,
+                'taggable_id' => $itemId,
+            ], $itemIds)
+        );
+    }
+
+    /**
+     * Pluck the primary keys of a Filament bulk-action selection without hydrating
+     * models, so "select all" over very large tables stays fast and memory-safe.
+     *
+     * @return array<int>
+     */
+    public static function selectedRecordIds(Builder $recordsQuery): array
+    {
+        $keyName = $recordsQuery->getModel()->getQualifiedKeyName();
+
+        return $recordsQuery
+            ->reorder()
+            ->select($keyName)
+            ->toBase()
+            ->pluck($keyName)
+            ->all();
     }
 
     /**
@@ -1456,28 +1592,28 @@ class PlaylistService
     /**
      * Get the BulkAction for adding items to a custom playlist.
      *
-     * @param  \Closure|null  $resolveRecordsCallback  Returns the items to add from the records: fn($records) => $records->flatMap->channels
+     * Dispatches a queued job so very large selections (100k+ items) cannot hit
+     * the HTTP timeout; only the selected IDs are plucked during the request.
      */
-    public static function getAddToPlaylistBulkAction(string $name = 'add', string $type = 'channel', ?\Closure $resolveRecordsCallback = null): BulkAction
+    public static function getAddToPlaylistBulkAction(string $name = 'add', string $type = 'channel'): BulkAction
     {
         return BulkAction::make($name)
             ->label('Add to Custom Playlist')
             ->schema(self::getAddToPlaylistSchema($type))
-            ->action(function (Collection $records, array $data) use ($type, $resolveRecordsCallback): void {
-                $playlist = CustomPlaylist::findOrFail($data['playlist']);
+            ->fetchSelectedRecords(false)
+            ->action(function (Builder $recordsQuery, array $data) use ($type): void {
+                AddItemsToCustomPlaylist::dispatch(
+                    userId: auth()->id(),
+                    itemIds: self::selectedRecordIds($recordsQuery),
+                    customPlaylistId: (int) $data['playlist'],
+                    data: $data,
+                    type: $type,
+                );
 
-                $items = $records;
-                if ($resolveRecordsCallback) {
-                    $items = $resolveRecordsCallback($records);
-                }
-
-                self::addItemsToPlaylist($playlist, $items, $data, $type);
-            })
-            ->after(function () {
                 Notification::make()
-                    ->success()
-                    ->title('Items added to custom playlist')
-                    ->body('The selected items have been added to the chosen custom playlist.')
+                    ->info()
+                    ->title(__('Adding items to custom playlist'))
+                    ->body(__('The selected items are being added to the chosen custom playlist in the background. You will be notified when complete.'))
                     ->send();
             })
             ->deselectRecordsAfterCompletion()
