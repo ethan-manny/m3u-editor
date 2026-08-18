@@ -20,6 +20,10 @@ beforeEach(function () {
     Event::fake([PlaylistCreated::class, PlaylistUpdated::class]);
     Notification::fake();
 
+    // The job fans its work out via Bus::batch(); run the batch on the real
+    // sync queue driver so the chunk jobs execute inline against the test database
+    config(['queue.default' => 'sync']);
+
     $this->user = User::factory()->create();
     $this->playlist = Playlist::factory()->create(['user_id' => $this->user->id]);
     $this->customPlaylist = CustomPlaylist::factory()->create(['user_id' => $this->user->id]);
